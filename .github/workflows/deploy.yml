@@ -4,6 +4,9 @@ on:
   push:
     branches:
       - main
+    paths:
+      - 'backend/**'
+      - '.github/workflows/deploy.yml'
   workflow_dispatch:
 
 permissions:
@@ -53,6 +56,7 @@ jobs:
           key: ${{ secrets.EC2_SSH_KEY }}
           port: 22
           command_timeout: 10m
+
           script: |
             set -e
 
@@ -62,82 +66,109 @@ jobs:
             REPO_URL="https://github.com/${{ github.repository }}.git"
             BRANCH="main"
 
-            echo "Deployment started: $(date)"
+            echo "======================================"
+            echo "Backend deployment started"
+            echo "======================================"
 
             mkdir -p /var/www/backend
 
             if [ -d "$REPO_DIR/.git" ]; then
+
+              echo "Updating existing repository..."
               cd "$REPO_DIR"
+
               git fetch origin "$BRANCH"
               git reset --hard "origin/$BRANCH"
 
-              # Preserve server-side configuration files
+              # Keep production environment file
               git clean -fd \
-                -e backend/.env \
-                -e backend/ecosystem.config.js
+                -e backend/.env
+
             else
+
+              echo "Repository not found. Cloning..."
+              
               if [ -e "$REPO_DIR" ]; then
                 echo "ERROR: $REPO_DIR exists but is not a Git repository."
                 exit 1
               fi
 
-              git clone --branch "$BRANCH" \
-                --single-branch "$REPO_URL" "$REPO_DIR"
+              git clone \
+                --branch "$BRANCH" \
+                --single-branch \
+                "$REPO_URL" \
+                "$REPO_DIR"
+
             fi
 
-            # Keep existing production configuration when migrating
-            # from the previous deployment directory.
+            echo "Preparing backend directory..."
             mkdir -p "$APP_DIR"
 
+            # Preserve existing .env from previous deployment
             if [ ! -f "$APP_DIR/.env" ] && [ -f "$OLD_APP_DIR/.env" ]; then
+              echo "Copying existing production .env..."
               cp "$OLD_APP_DIR/.env" "$APP_DIR/.env"
-            fi
-
-            if [ ! -f "$APP_DIR/ecosystem.config.js" ] \
-              && [ -f "$OLD_APP_DIR/ecosystem.config.js" ]; then
-              cp "$OLD_APP_DIR/ecosystem.config.js" \
-                "$APP_DIR/ecosystem.config.js"
             fi
 
             cd "$APP_DIR"
 
+            # Production environment is required
             if [ ! -f ".env" ]; then
               echo "ERROR: Production .env file is missing."
-              exit 1
-            fi
-
-            if [ ! -f "ecosystem.config.js" ]; then
-              echo "ERROR: ecosystem.config.js is missing."
               exit 1
             fi
 
             echo "Installing production dependencies..."
             npm ci --omit=dev
 
-            echo "Restarting backend..."
-            if pm2 describe backend-api > /dev/null 2>&1; then
-              pm2 reload ecosystem.config.js --env production
+            echo "======================================"
+            echo "Restarting backend with PM2"
+            echo "======================================"
+
+            if pm2 describe backend > /dev/null 2>&1; then
+
+              echo "Existing PM2 process found."
+              pm2 reload backend
+
             else
-              pm2 start ecosystem.config.js --env production
+
+              echo "PM2 process not found. Starting backend..."
+              pm2 start src/server.js --name backend
+
             fi
 
             pm2 save
 
-            echo "Waiting for application..."
+            echo "Waiting for backend..."
             sleep 5
 
             echo "Running health check..."
-            HTTP_STATUS=$(curl -sS --max-time 10 \
+
+            HTTP_STATUS=$(curl -sS \
+              --max-time 10 \
               -o /dev/null \
               -w "%{http_code}" \
               http://localhost:5000/api/health || true)
 
             if [ "$HTTP_STATUS" = "200" ]; then
-              echo "SUCCESS: Health check passed."
+
+              echo "======================================"
+              echo "SUCCESS: Backend health check passed"
+              echo "HTTP Status: $HTTP_STATUS"
+              echo "======================================"
+
             else
-              echo "ERROR: Health check returned HTTP $HTTP_STATUS"
-              pm2 logs backend-api --lines 30 --nostream
+
+              echo "======================================"
+              echo "ERROR: Backend health check failed"
+              echo "HTTP Status: $HTTP_STATUS"
+              echo "======================================"
+
+              pm2 status
+              pm2 logs backend --lines 30 --nostream
+
               exit 1
+
             fi
 
             echo "Deployment finished: $(date)"
